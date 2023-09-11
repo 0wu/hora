@@ -29,7 +29,7 @@ class ProprioAdaptTConv(nn.Module):
     def __init__(self):
         super(ProprioAdaptTConv, self).__init__()
         self.channel_transform = nn.Sequential(
-            nn.Linear(16 + 16, 32),
+            nn.Linear(16 + 16 + 16, 32),    
             nn.ReLU(inplace=True),
             nn.Linear(32, 32),
             nn.ReLU(inplace=True),

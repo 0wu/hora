@@ -1,6 +1,6 @@
 # --------------------------------------------------------
-# In-Hand Object Rotation via Rapid Motor Adaptation
-# https://arxiv.org/abs/2210.04887
+# In-Hand Object Rotation via Rapid Motor Adapatation
+# https://[arxiv link]
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
@@ -10,7 +10,6 @@ import os
 from hora.algo.models.models import ActorCritic
 from hora.algo.models.running_mean_std import RunningMeanStd
 import torch
-from hora.utils.misc import tprint
 
 
 def _obs_allegro2hora(obses):
@@ -36,12 +35,13 @@ class HardwarePlayer(object):
         self.actions_num = 16
         self.device = 'cuda'
 
-        obs_shape = (96,)
+        obs_shape = (144,)
+        self.network_config = config.train.network
         net_config = {
             'actions_num': self.actions_num,
             'input_shape': obs_shape,
-            'actor_units': [512, 256, 128],
-            'priv_mlp_units': [256, 128, 8],
+            'actor_units': self.network_config.mlp.units,
+            'priv_mlp_units': self.network_config.priv_mlp.units,
             'priv_info': True,
             'proprio_adapt': True,
             'priv_info_dim': 9,
@@ -52,21 +52,8 @@ class HardwarePlayer(object):
         self.model.eval()
         self.running_mean_std = RunningMeanStd(obs_shape).to(self.device)
         self.running_mean_std.eval()
-        self.sa_mean_std = RunningMeanStd((30, 32)).to(self.device)
+        self.sa_mean_std = RunningMeanStd((30, 48)).to(self.device)
         self.sa_mean_std.eval()
-        # hand setting
-        self.init_pose = [
-            0.0627, 1.2923, 0.3383, 0.1088, 0.0724, 1.1983, 0.1551, 0.1499,
-            0.1343, 1.1736, 0.5355, 0.2164, 1.1202, 1.1374, 0.8535, -0.0852,
-        ]
-        self.allegro_dof_lower = torch.from_numpy(np.array([
-            -0.4700, -0.1960, -0.1740, -0.2270, 0.2630, -0.1050, -0.1890, -0.1620,
-            -0.4700, -0.1960, -0.1740, -0.2270, -0.4700, -0.1960, -0.1740, -0.2270
-        ])).to(self.device)
-        self.allegro_dof_upper = torch.from_numpy(np.array([
-            0.4700, 1.6100, 1.7090, 1.6180, 1.3960, 1.1630, 1.6440, 1.7190,
-            0.4700, 1.6100, 1.7090, 1.6180, 0.4700, 1.6100, 1.7090, 1.6180
-        ])).to(self.device)
 
     def deploy(self):
         import rospy
@@ -80,32 +67,48 @@ class HardwarePlayer(object):
         hz = 20
         ros_rate = rospy.Rate(hz)
 
+        pose_init = [
+            0.0627, 1.2923, 0.3383, 0.1088,
+            0.0724, 1.1983, 0.1551, 0.1499,
+            0.1343, 1.1736, 0.5355, 0.2164,
+            1.1202, 1.1374, 0.8535, -0.0852,
+        ]
+        dof_lower = np.array([
+            -0.4700, -0.1960, -0.1740, -0.2270, 0.2630, -0.1050, -0.1890, -0.1620,
+            -0.4700, -0.1960, -0.1740, -0.2270, -0.4700, -0.1960, -0.1740, -0.2270
+        ])
+        dof_upper = np.array([
+            0.4700, 1.6100, 1.7090, 1.6180, 1.3960, 1.1630, 1.6440, 1.7190,
+            0.4700, 1.6100, 1.7090, 1.6180, 0.4700, 1.6100, 1.7090, 1.6180
+        ])
         # command to the initial position
+        allegro.command_joint_position(pose_init)
+        input('press to run policy')
+
         for t in range(hz * 4):
-            tprint(f'setup {t} / {hz * 4}')
-            allegro.command_joint_position(self.init_pose)
-            obses, _ = allegro.poll_joint_position(wait=True)
+            print(f'{t} / {hz * 4}')
+            allegro.command_joint_position(pose_init)
             ros_rate.sleep()
 
         obses, _ = allegro.poll_joint_position(wait=True)
         obses = _obs_allegro2hora(obses)
         # hardware deployment buffer
-        obs_buf = torch.from_numpy(np.zeros((1, 16 * 3 * 2)).astype(np.float32)).cuda()
-        proprio_hist_buf = torch.from_numpy(np.zeros((1, 30, 16 * 2)).astype(np.float32)).cuda()
+        obs_buf = torch.from_numpy(np.zeros((1, 16 * 3 * 3)).astype(np.float32)).cuda()
+        proprio_hist_buf = torch.from_numpy(np.zeros((1, 30, 16 * 3)).astype(np.float32)).cuda()
 
         def unscale(x, lower, upper):
             return (2.0 * x - upper - lower) / (upper - lower)
 
-        obses = torch.from_numpy(obses.astype(np.float32)).cuda()
-        prev_target = obses[None].clone()
-        cur_obs_buf = unscale(obses, self.allegro_dof_lower, self.allegro_dof_upper)[None]
+        prev_target = torch.from_numpy(obses[None].astype(np.float32)).cuda()
+        cur_obs_buf = torch.from_numpy(unscale(obses, dof_lower, dof_upper)[None]).cuda()
 
         for i in range(3):
             obs_buf[:, i*16+0:i*16+16] = cur_obs_buf.clone()  # joint position
-            obs_buf[:, i*16+16:i*16+32] = prev_target.clone()  # current target (obs_t-1 + s * act_t-1)
+            obs_buf[:, i*16+16:i*16+32] = 0  # previous action
+            obs_buf[:, i*16+32:i*16+48] = cur_obs_buf.clone()  # current target (obs_t-1 + s * act_t-1)
 
         proprio_hist_buf[:, :, :16] = cur_obs_buf.clone()
-        proprio_hist_buf[:, :, 16:32] = prev_target.clone()
+        proprio_hist_buf[:, :, 32:48] = cur_obs_buf.clone()
 
         while True:
             obs = self.running_mean_std(obs_buf.clone())
@@ -117,29 +120,28 @@ class HardwarePlayer(object):
             action = torch.clamp(action, -1.0, 1.0)
 
             target = prev_target + self.action_scale * action
-            target = torch.clip(target, self.allegro_dof_lower, self.allegro_dof_upper)
+            target = torch.clip(target, torch.from_numpy(dof_lower).cuda(), torch.from_numpy(dof_upper).cuda())
             prev_target = target.clone()
-            # interact with the hardware
             commands = target.cpu().numpy()[0]
             commands = _action_hora2allegro(commands)
             allegro.command_joint_position(commands)
-            ros_rate.sleep()  # keep 20 Hz command
-            # get o_{t+1}
+            ros_rate.sleep()
+
             obses, torques = allegro.poll_joint_position(wait=True)
             obses = _obs_allegro2hora(obses)
-            obses = torch.from_numpy(obses.astype(np.float32)).cuda()
 
-            cur_obs_buf = unscale(obses, self.allegro_dof_lower, self.allegro_dof_upper)[None]
-            prev_obs_buf = obs_buf[:, 32:].clone()
-            obs_buf[:, :64] = prev_obs_buf
-            obs_buf[:, 64:80] = cur_obs_buf.clone()
-            obs_buf[:, 80:96] = target.clone()
+            cur_obs_buf = torch.from_numpy(unscale(obses, dof_lower, dof_upper)[None]).cuda()
+            prev_obs_buf = obs_buf[:, 48:].clone()
+            obs_buf[:, :96] = prev_obs_buf
+            obs_buf[:, 96:112] = cur_obs_buf.clone()
+            obs_buf[:, 112:128] = action.clone()
+            obs_buf[:, 128:144] = target.clone()
 
             priv_proprio_buf = proprio_hist_buf[:, 1:30, :].clone()
-            cur_proprio_buf = torch.cat([
-                cur_obs_buf, target.clone()
+            cur_sa_buf = torch.cat([
+                cur_obs_buf, action.clone(), target.clone()
             ], dim=-1)[:, None]
-            proprio_hist_buf[:] = torch.cat([priv_proprio_buf, cur_proprio_buf], dim=1)
+            proprio_hist_buf[:] = torch.cat([priv_proprio_buf, cur_sa_buf], dim=1)
 
     def restore(self, fn):
         checkpoint = torch.load(fn)
